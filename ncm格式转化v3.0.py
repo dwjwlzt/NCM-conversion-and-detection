@@ -1,6 +1,5 @@
 import os
 import sys
-import struct
 import base64
 import json
 import shutil
@@ -8,43 +7,38 @@ import threading
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
-try:
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad as aes_unpad
-    HAS_PYCRYPTODOME = True
-except ImportError:
-    HAS_PYCRYPTODOME = False
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad as aes_unpad
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
 MAGIC = b"CTENFDAM"
-CORE_KEY = bytes([
-    0x68, 0x7A, 0x48, 0x6D, 0x73, 0xF1, 0x16, 0xB8,
-    0x3D, 0x1C, 0xC8, 0x66, 0x16, 0xC5, 0x18, 0x2C,
-])
-META_KEY = bytes([
-    0x23, 0x31, 0x34, 0x6C, 0x6A, 0x6B, 0x5F, 0x21,
-    0x5C, 0x5D, 0x26, 0x30, 0x55, 0x3C, 0x27, 0x28,
-])
-META_PREFIX = b"163 key(Don't modify anything)"
+AES_KEY_RC4 = bytes.fromhex("687A4852416D736F356B496E62617857")
+AES_KEY_META = bytes.fromhex("2331346C6A6B5F215C5D2630553C2728")
+XOR_RC4_KEY = 0x64
+XOR_META = 0x63
+PREFIX_NETEASE = b"neteasecloudmusic"
+PREFIX_META = b"163 key(Don't modify):"
 
 
-def rc4_crypt(data: bytes, key: bytes) -> bytes:
+def _ncm_rc4_build_box(key: bytes) -> bytes:
     S = list(range(256))
     j = 0
     for i in range(256):
-        j = (j + S[i] + key[i % len(key)]) % 256
+        j = (j + S[i] + key[i % len(key)]) & 0xFF
         S[i], S[j] = S[j], S[i]
+    key_box = bytearray(256)
+    for i in range(256):
+        j = (i + 1) & 0xFF
+        sj = S[j]
+        sjj = S[(sj + j) & 0xFF]
+        key_box[i] = S[(sjj + sj) & 0xFF]
+    return bytes(key_box)
 
-    i = j = 0
-    result = bytearray()
-    for byte in data:
-        i = (i + 1) % 256
-        j = (j + S[i]) % 256
-        S[i], S[j] = S[j], S[i]
-        result.append(byte ^ S[(S[i] + S[j]) % 256])
-    return bytes(result)
+
+def _ncm_rc4_decrypt(data: bytes, key_box: bytes) -> bytes:
+    return bytes(b ^ key_box[i & 0xFF] for i, b in enumerate(data))
 
 
 def decrypt_ncm(ncm_path: str, output_dir: str):
@@ -54,35 +48,51 @@ def decrypt_ncm(ncm_path: str, output_dir: str):
     if raw[:8] != MAGIC:
         raise ValueError("不是有效的NCM文件（魔数校验失败）")
 
-    pos = 8
-    key_len = struct.unpack(">H", raw[pos:pos + 2])[0]
-    pos += 2
-    encrypted_key = raw[pos:pos + key_len]
-    pos += key_len
+    pos = 10
 
-    aes_key = rc4_crypt(encrypted_key, CORE_KEY)
+    rc4_key_size = int.from_bytes(raw[pos:pos + 4], "little")
+    pos += 4
+    rc4_key_enc = raw[pos:pos + rc4_key_size]
+    pos += rc4_key_size
 
-    meta_len = struct.unpack(">H", raw[pos:pos + 2])[0]
-    pos += 2
-    encrypted_meta = raw[pos:pos + meta_len]
-    pos += meta_len
+    meta_size = int.from_bytes(raw[pos:pos + 4], "little")
+    pos += 4
+    meta_enc = raw[pos:pos + meta_size]
+    pos += meta_size
+
+    pos += 9
+
+    cover_size = int.from_bytes(raw[pos:pos + 4], "little")
+    pos += 4
+    cover_data = raw[pos:pos + cover_size]
+    pos += cover_size
+
+    audio_enc = raw[pos:]
+
+    rc4_key_xor = bytes(b ^ XOR_RC4_KEY for b in rc4_key_enc)
+    cipher = AES.new(AES_KEY_RC4, AES.MODE_ECB)
+    rc4_key_full = aes_unpad(cipher.decrypt(rc4_key_xor), 16)
+    rc4_key = rc4_key_full[len(PREFIX_NETEASE):]
 
     meta_json = {}
-    ext = ".mp3"
-
-    if HAS_PYCRYPTODOME:
-        meta_raw = rc4_crypt(encrypted_meta, META_KEY)
+    ext = ".flac"
+    if meta_size > 0:
         try:
-            if meta_raw.startswith(META_PREFIX):
-                meta_raw = meta_raw[len(META_PREFIX):]
-            cipher = AES.new(aes_key, AES.MODE_ECB)
-            dec = aes_unpad(cipher.decrypt(base64.b64decode(meta_raw)), 16)
-            meta_json = json.loads(dec.decode("utf-8", errors="replace"))
-            ext = "." + meta_json.get("format", "mp3")
+            meta_xor = bytes(b ^ XOR_META for b in meta_enc)
+            if not meta_xor.startswith(PREFIX_META):
+                raise ValueError("meta 前缀不匹配")
+            meta_b64 = base64.b64decode(meta_xor[len(PREFIX_META):])
+            cipher_meta = AES.new(AES_KEY_META, AES.MODE_ECB)
+            meta_json_raw = aes_unpad(cipher_meta.decrypt(meta_b64), 16)
+            meta_str = meta_json_raw.decode("utf-8", errors="replace")
+            if meta_str.startswith("music:"):
+                meta_json = json.loads(meta_str[6:])
+                ext = "." + meta_json.get("format", "flac")
         except Exception:
             pass
 
-    audio_data = rc4_crypt(raw[pos:], aes_key)
+    key_box = _ncm_rc4_build_box(rc4_key)
+    audio_data = _ncm_rc4_decrypt(audio_enc, key_box)
 
     song_name = meta_json.get("musicName", "") or os.path.splitext(
         os.path.basename(ncm_path)
@@ -122,14 +132,6 @@ class NcmConvertGUI(ctk.CTk):
 
         self._build_ui()
 
-        if not HAS_PYCRYPTODOME:
-            messagebox.showwarning(
-                "依赖提示",
-                "未检测到 pycryptodome 库。\n"
-                "将使用 NCM 文件名作为输出文件名，无法获取歌曲元数据。\n"
-                "可在虚拟环境中运行: pip install pycryptodome",
-            )
-
     def _build_ui(self):
         pad = 16
 
@@ -142,7 +144,7 @@ class NcmConvertGUI(ctk.CTk):
 
         subtitle = ctk.CTkLabel(
             self,
-            text="批量解密 .ncm 格式为无损音频文件（无需外部exe）",
+            text="批量解密 .ncm 格式为原始音频文件（无需外部exe）",
             font=ctk.CTkFont(size=13),
             text_color="gray",
         )
@@ -303,10 +305,10 @@ class NcmConvertGUI(ctk.CTk):
             full = os.path.join(src_dir, name)
             if os.path.isfile(full):
                 ext = os.path.splitext(name)[1].lower()
-                if ext in (".ncm", ".mp3"):
+                if ext in (".ncm", ".mp3", ".flac"):
                     file_list.append((full, ext))
 
-        self.log(f"扫描到 {len(file_list)} 个待处理文件 (ncm/mp3)")
+        self.log(f"扫描到 {len(file_list)} 个待处理文件 (ncm/mp3/flac)")
         self.log("─" * 48)
 
         for filepath, ext in file_list:
@@ -316,10 +318,18 @@ class NcmConvertGUI(ctk.CTk):
                 if ext == ".ncm":
                     self.log(f"[NCM] 解密：{basename}")
                     out_path, meta = decrypt_ncm(filepath, self.music_out_dir)
+                    info_parts = []
+                    if meta.get("musicName"):
+                        info_parts.append(meta["musicName"])
+                    if meta.get("artist"):
+                        artists = "/".join(a[0] if isinstance(a, list) else str(a) for a in meta["artist"])
+                        info_parts.append(artists)
+                    if info_parts:
+                        self.log(f"  信息：{' - '.join(info_parts)}")
                     self.log(f"  ✅ {os.path.basename(out_path)}")
                     success += 1
-                elif ext == ".mp3":
-                    self.log(f"[MP3] 复制：{basename}")
+                else:
+                    self.log(f"[{ext[1:].upper()}] 复制：{basename}")
                     dst = self.resolve_conflict(
                         os.path.join(self.music_out_dir, basename)
                     )
