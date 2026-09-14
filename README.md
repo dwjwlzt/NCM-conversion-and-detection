@@ -1,39 +1,32 @@
-# NCM 格式转换工具
+# NCM 格式转换 & FLAC 检测工具
 
-批量解密网易云音乐 .ncm 加密格式，转换为原始音频文件（.flac / .mp3）。
+批量解密网易云音乐 .ncm 加密格式，以及识别由有损转码的假无损 FLAC 文件。
 
-## 版本概览
+## 目录
 
-本项目经历了三个版本的演化，核心差异在于 **NCM 解密方式** 和 **GUI 技术栈**：
+- [NCM 格式转换](#ncm-格式转换)
+  - [v3.0 — 纯Python实现（推荐）](#v30--纯python实现推荐)
+  - [v1.0 / v2.0](#v10--调用-ncmdumpexe)
+  - [使用方法](#使用方法)
+- [FLAC 假无损检测](#flac-假无损检测)
+- [环境要求与安装](#环境要求与安装)
+- [文件说明](#文件说明)
 
-| | v1.0 | v2.0 | v3.0 |
-|---|------|------|------|
-| 脚本 | ncm格式转化.py | ncm格式转化v2.0.py | ncm格式转化v3.0.py |
-| 解密方式 | 调用 ncmdump.exe（网上找的） | 调用 NCM转mp3拖一拖.exe（原MP3工具附带） | **纯Python实现，无外部exe** |
-| GUI 框架 | tkinter（标准库） | customtkinter | customtkinter |
-| 元数据支持 | 依赖exe输出 | 依赖exe输出 | **独立获取歌名/艺术家/格式** |
-| 输出格式 | 依赖exe行为 | 依赖exe行为 | **自动识别flac/mp3原始格式** |
-| 额外依赖 | 无（仅标准库） | customtkinter | customtkinter + pycryptodome |
+---
 
-### 各版本详解
+## NCM 格式转换
 
-#### v1.0 — 调用 ncmdump.exe
+### v3.0 — 纯Python实现（推荐）
 
-最早的版本，GUI 基于 Python 标准库 tkinter，通过 subprocess 调用网上找到的 ncmdump.exe 进行解密。
+完全用 Python 实现 NCM v2 格式的解密算法，**不再依赖任何外部 exe**。
 
-#### v2.0 — 调用 NCM转mp3拖一拖.exe
-
-使用 customtkinter 重写了现代化界面，改为调用之前 MP3 转换工具附带的 NCM转mp3拖一拖.exe。由于 exe 行为不透明，文件处理逻辑（临时文件、输出文件检测）较为繁琐。
-
-#### v3.0 — 纯Python实现（推荐）
-
-完全用 Python 实现了 NCM v2 格式的解密算法，**不再依赖任何外部 exe**。核心原理：
+#### 解密原理
 
 ```
 文件结构:
   [8字节魔数 "CTENFDAM"]
   [2字节 gap]
-  [4字节小端长度] + 加密的 RC4 Key (128字节)
+  [4字节小端长度] + 加密的 RC4 Key
   [4字节小端长度] + 加密的 Meta JSON
   [4字节 CRC32]
   [5字节 gap]
@@ -41,89 +34,141 @@
   [加密的音频数据]
 
 解密流程:
-  1. RC4 Key: XOR 0x64 → AES-ECB (key=0x687A4852...) → 去padding → 去 "neteasecloudmusic" 前缀
-  2. Meta:    XOR 0x63 → 去 "163 key(Don't modify):" 前缀 → Base64 → AES-ECB (key=0x2331346C...) → JSON
-  3. 音频:    使用 NCM 变体 RC4（预计算key_box，非标准RC4）解密
+  1. RC4 Key: XOR 0x64 → AES-ECB → 去padding → 去 "neteasecloudmusic" 前缀
+  2. Meta:    XOR 0x63 → 去 "163 key(Don't modify):" 前缀 → Base64 → AES-ECB → JSON
+  3. 音频:    NCM 变体 RC4（预计算 key_box）解密
 ```
 
-## 功能特性
+#### 输出格式识别
 
-- **批量转换**：选择文件夹，一键批量解密所有 .ncm 文件
-- **自动整理**：转换后的文件统一输出到源文件夹下的 音乐/ 子目录
-- **实时日志**：图形界面显示处理进度和成功/失败状态
+解密后会按以下优先级确定文件扩展名：
+
+| 优先级 | 方式 | 说明 |
+|--------|------|------|
+| 1 | **音频文件头魔数检测** | 直接检查解密后音频的前 16 字节，识别 FLAC（`fLaC`）、MP3（`ID3` / `0xFF 0xFB`）、OGG（`OggS`）、WAV（`RIFF`）——最准确 |
+| 2 | NCM meta 元数据 | JSON 中的 `format` 字段作为兜底 |
+| 3 | `.flac` | 最终兜底 |
+
+相比旧版本硬编码 `.flac` 的策略，现在即便 meta 数据缺失或损坏也能正确识别真实格式。
+
+#### 文件名命名规则
+
+输出文件名按以下策略生成：
+
+| 条件 | 输出格式 | 示例 |
+|------|---------|------|
+| 有歌曲名 + 有歌手 | `歌曲名 - 歌手.ext` | `Alone - Alan Walker.flac` |
+| 只有歌曲名 | `歌曲名.ext` | `Title.flac` |
+| 只有歌手 | `歌手.ext` | `Artist.flac` |
+| meta 全空 | `原始文件名.ext` | `fallback.flac` |
+
+多歌手用 `/` 连接，如 `Song - A/B/C.flac`。文件名中的非法字符（`<>:"/\|?*`）自动替换为 `_`。
+
+#### 功能特性
+
+- **纯 Python 解密**：无需任何外部 exe
+- **音频魔数检测**：从文件头识别真实格式，避免格式错标
+- **文件名含歌手**：自动拼接为 `歌曲名 - 歌手`
+- **批量转换**：选择文件夹，一键处理所有 .ncm 文件
+- **自动整理**：输出到源文件夹下的 `音乐/` 子目录
+- **实时日志**：图形界面显示处理进度
 - **现代 UI**：基于 CustomTkinter，支持深色/浅色主题
-- **冲突处理**：同名文件自动添加 _copy 后缀，不会覆盖
-- **多线程**：转换过程不阻塞界面
+- **冲突处理**：同名文件自动加 `_copy` 后缀
+- **多线程**：转换不阻塞界面
 
-## 环境要求
+### v1.0 — 调用 ncmdump.exe
 
-- Windows 系统
-- Python 3.8+
-- 依赖库：customtkinter、pycryptodome
+最早的版本，基于 Python 标准库 tkinter，通过 subprocess 调用外部 ncmdump.exe 解密。
 
-## 安装依赖
+### v2.0 — 调用 NCM转mp3拖一拖.exe
 
-```powershell
-pip install -r requirements.txt
-```
+使用 customtkinter 重写界面，改为调用之前 MP3 转换工具附带的 exe。文件处理逻辑较为繁琐。
 
-或单独安装：
+> v1.0 / v2.0 均依赖外部 exe，推荐直接使用 v3.0。
 
-```powershell
-pip install customtkinter pycryptodome
-```
-
-## 使用方法
-
-### 方式一：运行 v3.0 纯Python版（推荐）
+### 使用方法
 
 ```powershell
 python ncm格式转化v3.0.py
 ```
 
-### 方式二：运行 v2.0（需外部exe）
-
-1. 确保 NCM转mp3拖一拖.exe 和脚本在同一目录
-2. 运行 `python ncm格式转化v2.0.py`
-
-### 方式三：运行 v1.0（需外部exe）
-
-1. 确保 ncmdump.exe 和脚本在同一目录
-2. 运行 `python ncm格式转化.py`
-
-### 通用操作
-
 1. 点击「选择文件夹」，选择包含 .ncm 文件的目录
 2. 点击「开始处理」，等待转换完成
-3. 转换后的文件保存在源文件夹的 音乐/ 子目录中
+3. 输出文件保存在源文件夹的 `音乐/` 子目录中
 
-### 打包为 EXE
-
+可选：打包为 exe
 ```powershell
 pyinstaller -F -w ncm格式转化v3.0.py
 ```
+
+---
+
+## FLAC 假无损检测
+
+一个独立的 GUI 工具，批量扫描 .flac 文件，识别那些由有损格式（如低码率 MP3）转码而来的**假无损**文件。
+
+### 原理
+
+FLAC 是真正的无损格式，解码后 PCM 数据与原始 PCM 完全一致。但如果源文件本身就是有损的（比如 128kbps MP3），再转码成 FLAC 也无法恢复丢失的信息——这种文件就是「假无损」。
+
+`flac检测.py` 通过调用 [flac-detective](https://pypi.org/project/flac-detective/) 这个外部 Python 库，对音频频谱、编码痕迹等进行分析，生成 HTML 检测报告。
+
+### 使用方法
+
+```powershell
+python flac检测.py
+```
+
+1. 点击「选择文件夹」，选择包含 .flac 文件的目录
+2. 可选勾选「深度扫描」——更严格识别高码率有损转码，速度稍慢
+3. 点击「开始检测」，等待完成
+4. 检测完成后可点击「打开报告」查看 HTML 报告
+
+### 运行依赖
+
+除了 customtkinter，还需要安装 `flac-detective`：
+
+```powershell
+pip install flac-detective
+```
+
+---
+
+## 环境要求与安装
+
+- Windows 系统
+- Python 3.8+
+
+```powershell
+pip install -r requirements.txt
+```
+
+或按需单独安装：
+
+| 工具 | 依赖 |
+|------|------|
+| ncm格式转化v3.0.py | `customtkinter`, `pycryptodome` |
+| flac检测.py | `customtkinter`, `flac-detective` |
+| v1.0 / v2.0 | 还需对应的外部 exe 文件 |
+
+---
 
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| ncm格式转化v3.0.py | **推荐使用**：纯Python解密，无需外部exe |
-| ncm格式转化v2.0.py | 调用 NCM转mp3拖一拖.exe 的版本 |
-| ncm格式转化.py | 最早版本，调用 ncmdump.exe |
-| flac检测.py | FLAC 文件检测工具 |
-| NCM转mp3拖一拖.exe | v2.0 所需的核心转换引擎 |
-| ncmdump.exe | v1.0 所需的备用转换工具 |
-| requirements.txt | Python 依赖清单 |
+| `ncm格式转化v3.0.py` | **推荐使用**：纯 Python NCM 解密，音频魔数检测 + 歌手命名 |
+| `flac检测.py` | 独立工具：FLAC 假无损检测，生成 HTML 报告 |
+| `ncm格式转化v2.0.py` | v2.0 版本，调用 NCM转mp3拖一拖.exe |
+| `ncm格式转化.py` | v1.0 版本，调用 ncmdump.exe |
+| `NCM转mp3拖一拖.exe` | v2.0 所需的外部转换引擎 |
+| `ncmdump.exe` | v1.0 所需的外部转换工具 |
+| `requirements.txt` | Python 依赖清单 |
+
+---
 
 ## 注意事项
 
-- 三个版本功能等价，但 v3.0 不再需要任何外部 exe，部署更简单
+- NCM 解密工具仅供学习交流使用，请支持正版音乐
+- FLAC 检测工具依赖 flac-detective 外部库，首次使用需单独安装
 - 源文件路径请避免包含特殊字符
-- 转换后的音频质量取决于原始 .ncm 文件的编码质量
-- 本工具仅供学习交流使用，请支持正版音乐
-
-## 版本历史
-
-- **v3.0**：纯Python实现NCM解密算法，不再依赖外部exe；使用customtkinter；正确获取元数据和原始格式
-- **v2.0**：使用customtkinter重写界面，切换exe为 NCM转mp3拖一拖.exe；增加批量处理、日志显示、冲突处理
-- **v1.0**：基于tkinter的初始版本，调用 ncmdump.exe 完成解密
