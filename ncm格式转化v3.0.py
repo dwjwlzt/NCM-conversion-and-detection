@@ -41,6 +41,19 @@ def _ncm_rc4_decrypt(data: bytes, key_box: bytes) -> bytes:
     return bytes(b ^ key_box[i & 0xFF] for i, b in enumerate(data))
 
 
+def detect_format_from_audio(audio_data: bytes) -> str:
+    head = audio_data[:16]
+    if head.startswith(b"fLaC"):
+        return ".flac"
+    if head.startswith(b"ID3") or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return ".mp3"
+    if head.startswith(b"OggS"):
+        return ".ogg"
+    if head.startswith(b"RIFF"):
+        return ".wav"
+    return ""
+
+
 def decrypt_ncm(ncm_path: str, output_dir: str):
     with open(ncm_path, "rb") as f:
         raw = f.read()
@@ -75,7 +88,6 @@ def decrypt_ncm(ncm_path: str, output_dir: str):
     rc4_key = rc4_key_full[len(PREFIX_NETEASE):]
 
     meta_json = {}
-    ext = ".flac"
     if meta_size > 0:
         try:
             meta_xor = bytes(b ^ XOR_META for b in meta_enc)
@@ -87,16 +99,32 @@ def decrypt_ncm(ncm_path: str, output_dir: str):
             meta_str = meta_json_raw.decode("utf-8", errors="replace")
             if meta_str.startswith("music:"):
                 meta_json = json.loads(meta_str[6:])
-                ext = "." + meta_json.get("format", "flac")
         except Exception:
             pass
 
     key_box = _ncm_rc4_build_box(rc4_key)
     audio_data = _ncm_rc4_decrypt(audio_enc, key_box)
 
-    song_name = meta_json.get("musicName", "") or os.path.splitext(
-        os.path.basename(ncm_path)
-    )[0]
+    ext = detect_format_from_audio(audio_data)
+    if not ext and meta_json:
+        ext = "." + meta_json.get("format", "flac")
+    if not ext:
+        ext = ".flac"
+
+    music_name = meta_json.get("musicName", "")
+    artist = meta_json.get("artist", "")
+    if isinstance(artist, list):
+        artist_names = [a[0] if isinstance(a, list) else str(a) for a in artist]
+        artist = "/".join(artist_names)
+
+    if music_name and artist:
+        song_name = f"{music_name} - {artist}"
+    elif music_name:
+        song_name = music_name
+    elif artist:
+        song_name = artist
+    else:
+        song_name = os.path.splitext(os.path.basename(ncm_path))[0]
 
     for ch in '<>:"/\\|?*':
         song_name = song_name.replace(ch, "_")
